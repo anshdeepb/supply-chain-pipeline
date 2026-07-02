@@ -7,3 +7,22 @@ __pycache__
 # CDK asset staging directory
 .cdk.staging
 cdk.out
+
+# Lambda Layer dependencies
+layers/ml/python/
+
+# Dataset files
+*.csv
+*.parquet
+
+# Model artifacts
+*.pkl
+
+# AWS credentials
+.aws/
+*.pem
+
+# OS/editor junk
+.DS_Store
+.vscode/
+.idea/

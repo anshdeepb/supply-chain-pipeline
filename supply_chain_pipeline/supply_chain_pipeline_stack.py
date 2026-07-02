@@ -63,7 +63,7 @@ class SupplyChainPipelineStack(Stack):
         )
 
         bronze.grant_read(glue_role)
-        silver.grant_read(glue_role)
+        silver.grant_write(glue_role)
         scripts.grant_read(glue_role)
 
         etl_job = glue.CfnJob(self, "BronzeToSilverJob",
@@ -83,7 +83,7 @@ class SupplyChainPipelineStack(Stack):
                               max_capacity=1
                               )
         
-        # Lambda Trigger
+        # Trigger Lambda
 
         trigger_lambda = _lambda.Function(self, "TriggerLambda",
                                           runtime=_lambda.Runtime.PYTHON_3_9,
@@ -107,5 +107,34 @@ class SupplyChainPipelineStack(Stack):
         bronze.add_event_notification(
             s3.EventType.OBJECT_CREATED,
             s3n.LambdaDestination(trigger_lambda)
+        )
+
+        # Training Lambda
+
+        ml_layer = _lambda.LayerVersion(self, "MLLayer",
+            code=_lambda.Code.from_asset("layers/ml"),
+            compatible_runtimes=[_lambda.Runtime.PYTHON_3_9],
+            description="pandas, scikit-learn, numpy"
+        )
+
+        training_lambda = _lambda.Function(self, "TrainingLambda",
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            handler="handler.lambda_handler",
+            code=_lambda.Code.from_asset("src/lambda_training/"),
+            timeout=Duration.minutes(5),
+            memory_size=512,
+            layers=[ml_layer],
+            environment={
+                "SILVER_BUCKET": silver.bucket_name,
+                "MODEL_BUCKET": model.bucket_name
+            }
+        )
+
+        silver.grant_read(training_lambda)
+        model.grant_write(training_lambda)
+
+        silver.add_event_notification(
+            s3.EventType.OBJECT_CREATED,
+            s3n.LambdaDestination(training_lambda)
         )
             
