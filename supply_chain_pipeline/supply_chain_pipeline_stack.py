@@ -7,6 +7,7 @@ from aws_cdk import aws_iam as iam
 
 from aws_cdk import aws_lambda as _lambda
 from aws_cdk import aws_s3_notifications as s3n
+from aws_cdk import aws_ecr_assets as ecr_assets
 from aws_cdk import Duration
 
 from constructs import Construct
@@ -111,24 +112,18 @@ class SupplyChainPipelineStack(Stack):
 
         # Training Lambda
 
-        ml_layer = _lambda.LayerVersion(self, "MLLayer",
-            code=_lambda.Code.from_asset("layers/ml"),
-            compatible_runtimes=[_lambda.Runtime.PYTHON_3_9],
-            description="pandas, scikit-learn, numpy"
-        )
-
-        training_lambda = _lambda.Function(self, "TrainingLambda",
-            runtime=_lambda.Runtime.PYTHON_3_9,
-            handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("src/lambda_training/"),
-            timeout=Duration.minutes(5),
-            memory_size=512,
-            layers=[ml_layer],
-            environment={
-                "SILVER_BUCKET": silver.bucket_name,
-                "MODEL_BUCKET": model.bucket_name
-            }
-        )
+        training_lambda = _lambda.DockerImageFunction(self, "TrainingLambda", 
+                                                      code=_lambda.DockerImageCode.from_image_asset(
+                                                          "src/lambda_training_container",
+                                                          platform=ecr_assets.Platform.LINUX_AMD64
+                                                          ),
+                                                          timeout=Duration.minutes(5),
+                                                          memory_size=1024,
+                                                          environment={
+                                                              "SILVER_BUCKET": silver.bucket_name,
+                                                              "MODEL_BUCKET": model.bucket_name
+                                                              }
+                                                        )
 
         silver.grant_read(training_lambda)
         model.grant_write(training_lambda)
