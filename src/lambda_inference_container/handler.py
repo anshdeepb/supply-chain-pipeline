@@ -23,15 +23,22 @@ def encode_features(df):
 
 def lambda_handler(event, context):
     try:
+        print("RAW EVENT:", json.dumps(event))
+
         body = json.loads(event['body']) if isinstance(event.get('body'), str) else event.get('body', event)
+        print("PARSED BODY:", body)
 
         input_df = pd.DataFrame([body])
+        print("BEFORE ENCODING:", input_df.to_dict(orient='records'))
 
         input_df = encode_features(input_df)
+        print("AFTER ENCODING COLUMNS:", input_df.columns.tolist())
 
         input_df = input_df.reindex(columns=feature_columns, fill_value=0)
+        print("FINAL MODEL INPUT:", input_df.to_dict(orient='records'))
 
         prediction = model.predict(input_df)[0]
+        print("PREDICTION:", prediction)
 
         return {
             'statusCode': 200,

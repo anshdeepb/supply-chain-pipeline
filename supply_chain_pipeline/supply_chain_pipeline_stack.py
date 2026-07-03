@@ -12,6 +12,9 @@ from aws_cdk import Duration
 
 from aws_cdk import aws_apigateway as apigateway
 
+from aws_cdk import aws_cloudwatch as cloudwatch
+from aws_cdk import aws_sns as sns
+
 from constructs import Construct
 
 class SupplyChainPipelineStack(Stack):
@@ -158,3 +161,11 @@ class SupplyChainPipelineStack(Stack):
 
         predict_resource = api.root.add_resource("predict")
         predict_resource.add_method("POST")
+
+        inference_lambda_errors = inference_lambda.metric_errors(period=Duration.minutes(5))
+        cloudwatch.Alarm(self, "InferenceLambdaErrorAlarm",
+            metric=inference_lambda_errors,
+            threshold=1,
+            evaluation_periods=1,
+            alarm_description="Fires when the prediction API Lambda has any errors"
+        )
