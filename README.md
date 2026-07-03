@@ -205,5 +205,3 @@ curl -X POST https://<api-gateway-url>/predict \
 | **Performance Efficiency** | Glue job sized to minimal DPU capacity for dataset scale; model bundle loaded outside the Lambda handler to persist across warm invocations |
 
 ---
-
-*Built for CSCI 4149 — Advanced Cloud Architecting, Summer 2026.*
