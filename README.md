@@ -29,46 +29,53 @@ Upload CSV
     │
     ▼
 S3 Bronze (raw data)
-    │  S3 event
+    │  S3 event (ObjectCreated)
     ▼
-Trigger Lambda ──────► Glue ETL Job (Python Shell)
-                              │  cleans, deduplicates, imputes
+Trigger Lambda ──────► Glue ETL Job (Python Shell, 1 DPU)
+                              │  dynamic Yes/No→0/1 mapping, dedup,
+                              │  target-null drop, median imputation
                               ▼
                         S3 Silver (clean_data.parquet)
-                              │  S3 event
+                              │  S3 event (ObjectCreated)
                               ▼
-                        Training Lambda (Docker container)
-                              │  encodes features, trains Linear Regression
+                        Training Lambda (Docker container image)
+                              │  drop ID columns (cardinality > 95% unique)
+                              │  one-hot encode remaining categoricals
+                              │  80/20 train-test split, fit LinearRegression
+                              │  log RMSE / R² / coefficients
                               ▼
-                        S3 Model (bundle.pkl)
+                        S3 Model (model/bundle.pkl — model + feature_columns)
                               │
                               ▼
-API Gateway ──────► Inference Lambda ──────► Prediction (product_wg_ton)
-    ▲
-    │
-Local client (predict.py)
+API Gateway (POST /predict) ──────► Inference Lambda (Docker container image)
+    ▲                                     │  same one-hot encoding as training
+    │                                     │  reindex to feature_columns, fill_value=0
+    │                                     ▼
+Local client (scripts/predict.py)   Prediction JSON {"predicted_product_wg_ton": ...}
+
+CloudWatch ── alarms on Lambda errors (trigger / training / inference) and Glue job failures, across all stages
 ```
 
 **Two-phase pipeline:**
 
 1. **Data pipeline** — Bronze (raw CSV) → Glue ETL cleans and validates → Silver (Parquet)
-2. **ML pipeline** — Silver triggers automatic model training → Model bucket → API Gateway serves live predictions
+2. **ML pipeline** — Silver triggers automatic model training → Model bucket → API Gateway serves live predictions from raw, human-readable warehouse attributes
 
-The two Lambda functions (training and inference) never call each other directly — they communicate only through the Model S3 bucket, keeping the system loosely coupled.
+The two Lambda functions (training and inference) never call each other directly — they communicate only through the Model S3 bucket, keeping the system loosely coupled. Both run the *identical* `encode_features` function so that a category seen at inference time is guaranteed to map to the same one-hot column the model was trained on; any column the model expects that isn't produced by a single-row request (e.g. a category not present in that specific request) is filled with `0` via `reindex`, correctly representing "this row is not that category."
 
 ## Tech Stack
 
 | Component | Service | Why |
 |---|---|---|
-| Raw/clean storage | Amazon S3 (4 buckets: Bronze, Silver, Model, Scripts) | Cheap, durable, inherently multi-AZ; separate buckets enforce single-responsibility storage |
-| ETL | AWS Glue (Python Shell job) | Dataset is a single flat CSV — Spark's distributed compute is unnecessary overhead; Python Shell is cheaper and faster to iterate |
-| Pipeline trigger | AWS Lambda | S3 can't invoke Glue directly; Lambda bridges the S3 event to the Glue API |
-| Model training/inference | AWS Lambda (Docker container image) | Pay-per-invocation avoids idle server costs (vs. EC2/SageMaker); container deployment was required once combined ML dependencies (pandas + scikit-learn) exceeded the 250MB zip/layer limit |
-| API exposure | Amazon API Gateway | Standard serverless pattern for exposing Lambda over HTTP |
-| IaC | AWS CDK (Python) | Full infrastructure defined in code; more readable and maintainable than raw CloudFormation YAML |
-| Monitoring | Amazon CloudWatch | Automatic logging for all Lambda/Glue executions; used for alarms and debugging |
+| Raw/clean storage | Amazon S3 (4 buckets: Bronze, Silver, Model, Scripts) | Cheap, durable, inherently multi-AZ; separate buckets enforce single-responsibility storage (data buckets hold pipeline data only, Scripts holds ETL code) |
+| ETL | AWS Glue (Python Shell job, 1 DPU) | Dataset is a single flat CSV — Spark's distributed compute (2–100 DPU) is unnecessary overhead; Python Shell (0.0625–1 DPU) is cheaper and faster to iterate |
+| Pipeline trigger | AWS Lambda | S3 event notifications can't invoke Glue directly (only Lambda, SNS, or SQS); Lambda bridges the S3 event to the Glue `StartJobRun` API |
+| Model training/inference | AWS Lambda (Docker container image via Amazon ECR) | Pay-per-invocation avoids idle server costs (vs. EC2/SageMaker); container deployment (10GB limit) was required once combined ML dependencies (pandas + scikit-learn + scipy, ~356MB) exceeded Lambda's 250MB zip/layer limit |
+| API exposure | Amazon API Gateway (`LambdaRestApi`, proxy integration) | Standard serverless pattern for exposing Lambda over HTTP; `POST /predict` resource explicitly defined rather than a catch-all proxy route |
+| IaC | AWS CDK (Python) | Full infrastructure defined in code; more readable and maintainable than raw CloudFormation YAML, and generates CloudFormation under the hood |
+| Monitoring | Amazon CloudWatch | Automatic logging for all Lambda/Glue executions; CloudWatch Alarms configured on Lambda error metrics (`metric_errors()`) and Glue job failed-task metrics |
 
-**SageMaker** was originally considered for model hosting but was unavailable due to AWS Academy Learner Lab IAM restrictions (unable to create a SageMaker execution role). Lambda was selected as the production-viable alternative.
+**SageMaker** was originally considered for model hosting but was unavailable due to AWS Academy Learner Lab IAM restrictions (unable to create a SageMaker execution role via the console or CDK). **EC2 + Flask** was also considered as a fallback, but rejected in favor of Lambda: EC2 bills hourly regardless of traffic, whereas Lambda's pay-per-invocation model better matches the pipeline's low, bursty inference load, and avoids server/OS management entirely.
 
 ## Prerequisites
 
@@ -84,24 +91,29 @@ The two Lambda functions (training and inference) never call each other directly
 ```
 supply_chain_pipeline/
 ├── app.py                          # CDK app entry point
-├── supply_chain_pipeline_stack.py  # All infrastructure defined here
+├── supply_chain_pipeline_stack.py  # All infrastructure: S3, Glue, Lambda,
+│                                    # API Gateway, IAM, CloudWatch alarms
 ├── glue/
 │   └── etl_job.py                  # Bronze → Silver cleaning script
+│                                    # (dynamic Yes/No mapping, dedup, imputation)
 ├── src/
 │   ├── lambda_trigger/
 │   │   └── handler.py              # S3 event → starts Glue job
 │   ├── lambda_training_container/  # Docker-based training Lambda
-│   │   ├── Dockerfile
-│   │   ├── requirements.txt
-│   │   └── handler.py
+│   │   ├── Dockerfile              # base: public.ecr.aws/lambda/python:3.9
+│   │   ├── requirements.txt        # pandas, scikit-learn, pyarrow, boto3
+│   │   └── handler.py              # drop IDs → encode → train → bundle → S3
 │   └── lambda_inference_container/ # Docker-based inference Lambda
 │       ├── Dockerfile
-│       ├── requirements.txt
-│       └── handler.py
+│       ├── requirements.txt        # pandas, scikit-learn, boto3 (no pyarrow needed)
+│       └── handler.py              # encode (identical to training) → reindex → predict
 ├── scripts/
-│   └── predict.py                  # Local client for demo predictions
-├── requirements.txt
+│   ├── predict.py                  # Interactive local client for demo predictions
+│   └── validate_predictions.py     # Samples real Silver rows, compares true vs.
+│                                    # predicted via the live API
+├── requirements.txt                # Root-level: CDK + local testing deps
 ├── cdk.json
+├── .gitignore                      # excludes .venv, cdk.out, layers/, datasets, *.pkl
 ├── runbook.md
 └── README.md
 ```
@@ -175,33 +187,88 @@ python scripts/predict.py
 
 You'll be prompted for warehouse attributes (capacity, worker count, distance from hub, etc.) and the script returns a predicted `product_wg_ton` value via the deployed API Gateway endpoint.
 
+**Important — send raw attributes, not pre-encoded values.** The inference Lambda replicates the exact training-time encoding pipeline (one-hot encoding via `pd.get_dummies`, followed by `reindex` against the saved `feature_columns` list) so the client can send human-readable category strings (e.g. `"zone": "North"`, `"WH_capacity_size": "Mid"`) rather than manually constructing one-hot columns.
+
 Or call the API directly:
 
 ```bash
-curl -X POST https://<api-gateway-url>/predict \
+curl -X POST https://<api-gateway-url>/prod/predict \
   -H "Content-Type: application/json" \
-  -d '{"WH_capacity_size": 3, "workers_num": 45, "dist_from_hub": 12, ...}'
+  -d '{
+    "num_refill_req_l3m": 4,
+    "transport_issue_l1y": 1,
+    "Competitor_in_mkt": 3,
+    "retail_shop_num": 4859,
+    "distributor_num": 42,
+    "flood_impacted": 0,
+    "flood_proof": 1,
+    "electric_supply": 1,
+    "dist_from_hub": 164,
+    "workers_num": 28,
+    "wh_est_year": 2015,
+    "storage_issue_reported_l3m": 2,
+    "temp_reg_mach": 1,
+    "wh_breakdown_l3m": 0,
+    "govt_check_l3m": 4,
+    "Location_type": "Urban",
+    "WH_capacity_size": "Mid",
+    "zone": "North",
+    "WH_regional_zone": "Zone 3",
+    "wh_owner_type": "Rented",
+    "approved_wh_govt_certificate": "B+"
+  }'
 ```
+
+Returns:
+```json
+{"predicted_product_wg_ton": 19630.84}
+```
+
+### Validating prediction accuracy
+
+Beyond a single manual test, the pipeline can be validated against real held-out data — sampling actual warehouse records from Silver, sending their raw attributes through the live API, and comparing predictions against the known true `product_wg_ton` values:
+
+```bash
+python scripts/validate_predictions.py
+```
+
+Example output from testing:
+```
+True: 32073.0  |  Predicted: 30930.0  |  Diff: 1143.0
+True:  5072.0  |  Predicted:  7905.2  |  Diff: 2833.2
+True:  8056.0  |  Predicted:  9702.9  |  Diff: 1646.9
+True: 23070.0  |  Predicted: 23991.7  |  Diff:  921.7
+True: 28086.0  |  Predicted: 32026.2  |  Diff: 3940.2
+```
+
+Most predictions land within roughly 4–20% of the true value, with larger relative error at the low end of the target's distribution — consistent with Linear Regression's known limitations modeling extreme values.
 
 ## Design Decisions
 
 - **S3 for Bronze/Silver instead of RDS** — prioritizes read speed and cost for bulk ML workloads; a future Gold-layer RDS table is the natural extension point for concurrent analyst SQL access.
 - **CSV → Parquet conversion at Silver** — columnar storage, better compression, and native type preservation compared to CSV; standard practice for medallion Silver/Gold layers.
-- **Dynamic, schema-agnostic cleaning** — the Glue ETL script detects binary Yes/No columns and imputes nulls without hardcoding column names, making it resilient to schema changes.
-- **Identifier columns dropped via cardinality threshold** (>95% unique values) rather than hardcoded by name — mirrors real-world practice of combining automated heuristics with explicit review.
-- **One-hot encoding over label encoding for nominal categories** (e.g. `zone`) — avoids implying a false ordinal relationship between categories with no inherent order.
-- **80/20 train-test split** — ensures RMSE/R² reflect performance on unseen data rather than an optimistic training-data score.
-- **Linear Regression as the initial model** — chosen for interpretability and fast training time within Lambda's execution constraints.
-- **Docker container Lambdas instead of zip + layers** — pandas + scikit-learn + scipy exceeded Lambda's 250MB unzipped layer limit; container images support up to 10GB and eliminated platform-compatibility issues between local development machines and Lambda's Amazon Linux runtime.
-- **Loosely coupled training/inference** — the two Lambdas share no direct dependency; they communicate exclusively through the Model S3 bucket.
+- **Dynamic, schema-agnostic cleaning** — the Glue ETL script detects binary Yes/No columns by inspecting each column's actual unique values (rather than hardcoding names like `flood_proof`), remains numeric-column-safe via `pd.api.types.is_numeric_dtype`, and applies duplicate removal, target-null exclusion, and median imputation only where relevant.
+- **Identifier columns dropped via cardinality threshold** (>95% unique values, `nunique() / len(df)`) rather than hardcoded by name (e.g. `Ware_house_ID`, `WH_Manager_ID`) — mirrors real-world practice of combining automated heuristics with explicit review, and makes the pipeline resilient to new ID-like columns appearing in future data.
+- **One-hot encoding over label encoding for nominal categories** (e.g. `zone`, `wh_owner_type`) — avoids implying a false ordinal relationship between categories with no inherent order. Acknowledged tradeoff: this treats all remaining categoricals as nominal rather than distinguishing genuinely ordinal ones (e.g. `WH_capacity_size`), trading a small amount of potential model signal for a simpler, fully schema-agnostic pipeline.
+- **80/20 train-test split** (`random_state=42`) — ensures RMSE/R² reflect performance on unseen data rather than an optimistic training-data score.
+- **Linear Regression as the initial model** — chosen for interpretability (coefficients directly show feature impact — the strongest predictor identified was `approved_wh_govt_certificate`, plausible given certification tiers commonly gate warehouse capacity/compliance) and fast training time within Lambda's execution constraints.
+- **Docker container Lambdas instead of zip + layers** — pandas + scikit-learn + scipy totaled ~356MB uncompressed (scipy alone: 103MB), exceeding Lambda's 250MB unzipped layer limit even after removing `pyarrow`. Container images (10GB limit, built from AWS's official `public.ecr.aws/lambda/python` base image) also eliminated a separate cross-platform issue: packages `pip install`-ed on a local Mac/Windows machine produced binaries incompatible with Lambda's Amazon Linux runtime (`Runtime.ImportModuleError: Unable to import required dependency numpy`), which the container's Linux-native build environment resolves automatically.
+- **Identical `encode_features` logic in training and inference** — both Lambdas run the exact same one-hot encoding function; the inference Lambda additionally calls `reindex(columns=feature_columns, fill_value=0)` against the column list saved in the model bundle at training time, guaranteeing a single-row inference request is encoded into precisely the same feature space the model was fit on, without requiring the client to pre-encode categorical values.
+- **Loosely coupled training/inference** — the two Lambdas share no direct dependency or invocation path; they communicate exclusively through the Model S3 bucket (`model/bundle.pkl`, containing both the fitted model and `feature_columns`).
 
 ## AWS Well-Architected Framework Alignment
 
 | Pillar | Implementation |
 |---|---|
-| **Operational Excellence** | Full IaC via CDK; structured CloudWatch logging in all Lambda/Glue executions; runbook included (see `runbook.md`) |
-| **Security** | All S3 buckets encrypted at rest (SSE-S3) with public access blocked; least-privilege IAM roles scoped per-service (e.g. Glue role can read Bronze/write Silver only); no hardcoded credentials |
-| **Reliability** | S3 is inherently multi-AZ; Glue job configured with retry and timeout limits; Bronze data retained indefinitely (`RemovalPolicy.RETAIN`) for reprocessing |
-| **Performance Efficiency** | Glue job sized to minimal DPU capacity for dataset scale; model bundle loaded outside the Lambda handler to persist across warm invocations |
+| **Operational Excellence** | Full IaC via CDK (zero manually created resources); structured `print`-based CloudWatch logging in all Lambda/Glue executions (row counts, RMSE/R², coefficients, encoding stages); CloudWatch Alarms on Lambda error metrics (`metric_errors()`) for all three Lambdas plus Glue job failed-task count; runbook included (see `runbook.md`) |
+| **Security** | All 4 S3 buckets encrypted at rest (`S3_MANAGED`) with `BLOCK_ALL` public access; least-privilege IAM scoped per-service (Glue role: read Bronze/write Silver/read Scripts only; inference Lambda: read-only on Model bucket, cannot write; training Lambda: read Silver/write Model only); no hardcoded credentials anywhere — all AWS access via IAM roles; development conducted under a dedicated non-root IAM user rather than AWS account root credentials; AWS Academy Learner Lab IAM restrictions (blocked SageMaker execution role creation) documented as a lab constraint with the production equivalent explained |
+| **Reliability** | S3 is inherently multi-AZ; Glue job configured with `max_retries=1` and a 10-minute timeout; Bronze data retained indefinitely (`RemovalPolicy.RETAIN`) enabling full reprocessing from raw source at any time; RTO ≈ 15 min (re-trigger pipeline from Bronze), RPO ≈ 0 (raw data never deleted) |
+| **Performance Efficiency** | Glue Python Shell job capped at 1 DPU (vs. Spark's 2–100 DPU default) given the dataset's small flat-file scale; model bundle loaded at Lambda module scope (outside the handler) so it persists across warm invocations instead of re-fetching from S3 on every request; end-to-end prediction accuracy validated against real held-out data (see [Validating prediction accuracy](#validating-prediction-accuracy)) |
+
+## Known Issues / Troubleshooting
+
+- **Stale API Gateway responses after redeploying the inference Lambda.** During development, POST requests through the deployed `/predict` endpoint intermittently returned an identical cached-looking prediction regardless of the payload sent, even with API Gateway stage caching confirmed disabled. Direct Lambda invocation (bypassing API Gateway) correctly returned different predictions for different inputs, isolating the issue to the API Gateway stage rather than the Lambda or model logic. Resolved by forcing an explicit new stage deployment (Console: **API Gateway → Resources → Actions → Deploy API → stage: prod**) rather than relying on `cdk deploy` alone to refresh the integration. If predictions appear unexpectedly static after a Lambda code change, redeploy the API stage manually and retest.
+- **`Runtime.ImportModuleError: numpy` on first Lambda Layer attempt.** Packages installed via plain `pip install` on a local Mac/Windows machine are compiled for that OS, not Lambda's Amazon Linux runtime. Resolved by moving to Docker container image deployment (see [Design Decisions](#design-decisions)).
+- **Unrealistic predictions from hand-typed test payloads.** Sending attribute values far outside the training data's real distribution (e.g. `retail_shop_num` far below the observed minimum) produces an unreliable, extrapolated prediction — expected behavior for a linear model, not a pipeline bug. Use `scripts/validate_predictions.py` to test against real sampled data instead of hand-typed values.
 
 ---
