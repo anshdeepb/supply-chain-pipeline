@@ -24,18 +24,6 @@ Common causes:
 | Model bucket empty | Manually invoke training Lambda |
 | Infrastructure missing | Run `cdk deploy --all` |
 
-```bash
-# Re-trigger Glue ETL job
-aws glue start-job-run --job-name <glue-job-name>
-
-# Manually invoke training Lambda
-aws lambda invoke --function-name <training-lambda-name> \
-  --payload '{}' response.json
-
-# Verify silver bucket updated
-aws s3 ls s3://<silver-bucket>/
-```
-
 ## 4. Verify Recovery
 - Glue job shows "Succeeded" in console
 - Model file timestamp updated in S3 model bucket
