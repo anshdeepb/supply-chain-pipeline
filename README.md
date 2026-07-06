@@ -1,3 +1,4 @@
+<img width="791" height="662" alt="CSCI4149_architecture_diagram drawio" src="https://github.com/user-attachments/assets/668a40bc-cb04-49a0-b7d5-d8d9470ddb90" />
 # Supply Chain Warehouse Throughput Prediction Pipeline
 
 A cloud-native, event-driven data pipeline built on AWS that ingests raw FMCG warehouse data, cleans it through a medallion architecture (Bronze → Silver), trains a regression model to predict warehouse product throughput, and exposes predictions via a REST API — all provisioned through Infrastructure as Code (AWS CDK).
@@ -24,37 +25,7 @@ This project predicts the total product weight (in tons) a warehouse is expected
 
 ## Architecture
 
-```
-Upload CSV
-    │
-    ▼
-S3 Bronze (raw data)
-    │  S3 event (ObjectCreated)
-    ▼
-Trigger Lambda ──────► Glue ETL Job (Python Shell, 1 DPU)
-                              │  dynamic Yes/No→0/1 mapping, dedup,
-                              │  target-null drop, median imputation
-                              ▼
-                        S3 Silver (clean_data.parquet)
-                              │  S3 event (ObjectCreated)
-                              ▼
-                        Training Lambda (Docker container image)
-                              │  drop ID columns (cardinality > 95% unique)
-                              │  one-hot encode remaining categoricals
-                              │  80/20 train-test split, fit LinearRegression
-                              │  log RMSE / R² / coefficients
-                              ▼
-                        S3 Model (model/bundle.pkl — model + feature_columns)
-                              │
-                              ▼
-API Gateway (POST /predict) ──────► Inference Lambda (Docker container image)
-    ▲                                     │  same one-hot encoding as training
-    │                                     │  reindex to feature_columns, fill_value=0
-    │                                     ▼
-Local client (scripts/predict.py)   Prediction JSON {"predicted_product_wg_ton": ...}
-
-CloudWatch ── alarms on Lambda errors (trigger / training / inference) and Glue job failures, across all stages
-```
+<img width="791" height="782" alt="CSCI4149_architecture_diagram-2" src="https://github.com/user-attachments/assets/dbaba388-4c99-4009-b6b3-38d83adf590a" />
 
 **Two-phase pipeline:**
 
