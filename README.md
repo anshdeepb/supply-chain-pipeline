@@ -1,4 +1,3 @@
-<img width="791" height="662" alt="CSCI4149_architecture_diagram drawio" src="https://github.com/user-attachments/assets/668a40bc-cb04-49a0-b7d5-d8d9470ddb90" />
 # Supply Chain Warehouse Throughput Prediction Pipeline
 
 A cloud-native, event-driven data pipeline built on AWS that ingests raw FMCG warehouse data, cleans it through a medallion architecture (Bronze → Silver), trains a regression model to predict warehouse product throughput, and exposes predictions via a REST API — all provisioned through Infrastructure as Code (AWS CDK).
