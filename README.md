@@ -224,25 +224,6 @@ Returns:
 {"predicted_product_wg_ton": 19630.84}
 ```
 
-### Validating prediction accuracy
-
-Beyond a single manual test, the pipeline can be validated against real held-out data — sampling actual warehouse records from Silver, sending their raw attributes through the live API, and comparing predictions against the known true `product_wg_ton` values:
-
-```bash
-python scripts/validate_predictions.py
-```
-
-Example output from testing:
-```
-True: 32073.0  |  Predicted: 30930.0  |  Diff: 1143.0
-True:  5072.0  |  Predicted:  7905.2  |  Diff: 2833.2
-True:  8056.0  |  Predicted:  9702.9  |  Diff: 1646.9
-True: 23070.0  |  Predicted: 23991.7  |  Diff:  921.7
-True: 28086.0  |  Predicted: 32026.2  |  Diff: 3940.2
-```
-
-Most predictions land within roughly 4–20% of the true value, with larger relative error at the low end of the target's distribution — consistent with Linear Regression's known limitations modeling extreme values.
-
 ## Design Decisions
 
 - **S3 for Bronze/Silver instead of RDS** — prioritizes read speed and cost for bulk ML workloads; a future Gold-layer RDS table is the natural extension point for concurrent analyst SQL access.
